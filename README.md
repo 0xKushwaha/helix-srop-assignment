@@ -1,100 +1,65 @@
-# Helix SROP — Ayush Kushwaha
+# Helix SROP
 
-**Stateful RAG Orchestration Pipeline** — AI Support Concierge for Helix, a B2B dev-tools platform.
+A production-ready **Stateful RAG Orchestration Pipeline** that powers an AI Support Concierge for Helix — a B2B developer tools platform.
 
-Handles two workflows in a single ongoing conversation:
-- **Knowledge questions** ("How do I rotate a deploy key?") → answered via RAG over product docs
-- **Account lookups** ("Show my last 3 failed builds") → answered via internal tools
+The system handles two distinct workflows within a single ongoing conversation: answering product documentation questions via retrieval-augmented generation, and resolving account queries via internal tooling — all with full session persistence, structured tracing, and async-first architecture.
 
-Built with **FastAPI · Google ADK · SQLite (SQLAlchemy 2.x async) · ChromaDB**.
+**Stack:** Python 3.12 · FastAPI · Google ADK · SQLite (SQLAlchemy 2.x async) · ChromaDB · Gemini 2.0 Flash
 
 ---
 
-## Quick Start (< 5 minutes)
-
-### 1. Clone and install
+## Setup
 
 ```bash
-git clone <your-repo-url>
+git clone <repo-url>
 cd helix-srop-assignment
 pip install -e ".[dev]"
-```
 
-### 2. Configure environment
+cp .env.example .env          # add GOOGLE_API_KEY
 
-```bash
-cp .env.example .env
-# Open .env and set GOOGLE_API_KEY=your-key-here
+python -m app.rag.ingest --path docs/
+uvicorn app.main:app --reload
 ```
 
 Get a free API key at [aistudio.google.com](https://aistudio.google.com).
 
-### 3. Ingest product docs into the vector store
+---
 
-```bash
-python -m app.rag.ingest --path docs/
-# Found 11 markdown files in docs/
-# Ingest complete. Total chunks: 87
-```
-
-### 4. Start the server
-
-```bash
-uvicorn app.main:app --reload
-# Uvicorn running on http://127.0.0.1:8000
-```
-
-### 5. Try it
+## Usage
 
 ```bash
 # Create a session
 SESSION=$(curl -s -X POST http://localhost:8000/v1/sessions \
   -H "Content-Type: application/json" \
-  -d '{"user_id": "u_demo", "plan_tier": "pro"}' \
+  -d '{"user_id": "u1", "plan_tier": "pro"}' \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['session_id'])")
 
-# Ask a knowledge question
+# Knowledge question — answered via RAG
 curl -s -X POST http://localhost:8000/v1/chat/$SESSION \
   -H "Content-Type: application/json" \
   -d '{"content": "How do I rotate a deploy key?"}' | python3 -m json.tool
 
-# Ask an account question
+# Account question — answered via tools
 curl -s -X POST http://localhost:8000/v1/chat/$SESSION \
   -H "Content-Type: application/json" \
   -d '{"content": "Show me my last 3 failed builds"}' | python3 -m json.tool
 
-# Healthcheck
-curl http://localhost:8000/healthz
+# Follow-up — state and history carry across turns
+curl -s -X POST http://localhost:8000/v1/chat/$SESSION \
+  -H "Content-Type: application/json" \
+  -d '{"content": "What is my current plan tier?"}' | python3 -m json.tool
 ```
 
 ---
 
-## Running Tests
+## Tests
 
 ```bash
 pytest -q
-# 13 passed, 1 skipped
+# 13 passed, 1 skipped in ~0.2s
 ```
 
-The skipped test (`test_search_docs_returns_results_with_chunk_ids`) requires a seeded vector store. After running ingest, all 14 tests pass.
-
-LLM is mocked at the ADK boundary (`_call_adk`) so tests run instantly without hitting the Gemini API.
-
----
-
-## API Reference
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/v1/sessions` | Create session. Body: `{"user_id": str, "plan_tier": "free"\|"pro"\|"enterprise"}` |
-| `POST` | `/v1/chat/{session_id}` | Send message. Body: `{"content": str}`. Returns `{reply, routed_to, trace_id}` |
-| `GET` | `/v1/traces/{trace_id}` | Fetch structured trace for one turn |
-| `GET` | `/healthz` | Health check |
-
-**Error responses** follow [RFC 7807](https://datatracker.ietf.org/doc/html/rfc7807):
-```json
-{"type": "...", "title": "SESSION_NOT_FOUND", "status": 404, "detail": "..."}
-```
+LLM is mocked at the `_call_adk` boundary — the full suite runs instantly without a real API key.
 
 ---
 
@@ -104,59 +69,74 @@ LLM is mocked at the ADK boundary (`_call_adk`) so tests run instantly without h
 POST /v1/chat/{session_id}
          │
          ▼
-┌─────────────────────────────────────────┐
-│  pipeline.run()                         │
-│  1. Load SessionState from SQLite       │
-│  2. Build root agent (state in prompt)  │
-│  3. asyncio.wait_for → ADK run          │
-│  4. Collect events (routing + tools)    │
-│  5. Persist state + messages + trace    │
-└────────────────┬────────────────────────┘
-                 │  AgentTool (LLM-driven routing)
-       ┌─────────┴──────────┐
-       ▼                    ▼
- KnowledgeAgent        AccountAgent
- └─ search_docs()      └─ get_recent_builds()
-       │                   get_account_status()
-       ▼
- ChromaDB (cosine)
- text-embedding-004
+┌─────────────────────────────────────────────┐
+│  SROP Pipeline                              │
+│  1. Load SessionState from SQLite           │
+│  2. Re-hydrate last 10 messages             │
+│  3. Build root agent (state + history)      │
+│  4. asyncio.wait_for → InMemoryRunner       │
+│  5. Stream events → routing + tool traces   │
+│  6. Persist state / messages / trace to DB  │
+└──────────────────┬──────────────────────────┘
+                   │  AgentTool (LLM-driven routing)
+         ┌─────────┴──────────┐
+         ▼                    ▼
+   KnowledgeAgent        AccountAgent
+   └─ search_docs()      └─ get_recent_builds()
+          │                  get_account_status()
+          ▼
+    ChromaDB · cosine similarity
+    Google text-embedding-004
 ```
 
-```
-SQLite schema
-├── users          (user_id PK, plan_tier, created_at)
-├── sessions       (session_id PK, user_id FK, state JSON, timestamps)
-├── messages       (message_id PK, session_id FK, role, content, trace_id)
-└── agent_traces   (trace_id PK, session_id, routed_to, tool_calls JSON,
-                    retrieved_chunk_ids JSON, latency_ms)
-```
+**Database schema**
+
+| Table | Purpose |
+|---|---|
+| `users` | user_id, plan_tier |
+| `sessions` | session_id, state (JSON), timestamps |
+| `messages` | per-turn user/assistant messages with trace_id |
+| `agent_traces` | routed_to, tool_calls, chunk_ids, latency_ms |
+
+---
+
+## API
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/v1/sessions` | Create session · `{user_id, plan_tier}` → `{session_id}` |
+| `POST` | `/v1/chat/{session_id}` | Send message → `{reply, routed_to, trace_id}` |
+| `GET` | `/v1/traces/{trace_id}` | Fetch structured turn trace |
+| `GET` | `/healthz` | Health check |
+
+Errors follow [RFC 7807](https://datatracker.ietf.org/doc/html/rfc7807) — `{type, title, status, detail}`.
 
 ---
 
 ## Design Decisions
 
-### State Persistence — Pattern 3 (SessionState injection)
+### State Persistence — Pattern 3 with History Re-hydration
 
-I used **Pattern 3**: store only `SessionState` (user_id, plan_tier, last_agent, turn_count) in the DB as a JSON column and inject it into the root agent's system instruction on every turn.
+Session state (`user_id`, `plan_tier`, `last_agent`, `turn_count`) is serialized to a JSON column in SQLite on every commit. The last 10 messages are loaded from the `messages` table and injected into the root agent's system prompt on each turn, giving the agent conversational memory without a custom `BaseSessionService` or ADK session replay.
 
-**Why:** The agent needs user context (plan tier, who they are) to route and respond correctly — not full conversation history. Pattern 3 is the lightest approach: no custom `BaseSessionService`, no full message history replay, no context window waste. Each turn creates a fresh `InMemoryRunner` with the user context baked into the instruction.
+This survives process restarts by design — the next request loads everything from the DB. The ADK `InMemoryRunner` is intentionally ephemeral; all durability lives in SQLAlchemy.
 
-**Tradeoff:** Prior conversation turns aren't visible to the agent. Users can't say "tell me more about step 2" across turns. Acceptable for a support concierge focused on routing; a chat assistant would need Pattern 2.
+### Routing — AgentTool, not String Parsing
 
-**Why state survives restarts:** `SessionState` is serialized to SQLite on every commit. On server restart, the next request loads it from DB — no in-memory state is lost.
+The root orchestrator uses ADK's `AgentTool` pattern. The LLM selects `knowledge_agent` or `account_agent` as a structured function call. Agent names are declared as module-level constants and matched exactly against `event.author` in the event stream — no substring heuristics.
 
-### Chunking — Heading-aware Markdown
+### RAG Pipeline
 
-Split on `# ## ###` headings to keep each section coherent, then sub-chunk long sections with fixed-size + overlap (512 chars, 64 overlap).
+- **Chunking:** Heading-aware markdown splitting (`# ## ###` boundaries) keeps procedural sections intact. Long sections are sub-chunked at 512 characters with 64-char overlap.
+- **Embeddings:** Google `text-embedding-004` (768-dim) at both ingest and query time with correct `task_type` (`retrieval_document` vs `retrieval_query`).
+- **Retrieval:** Cosine similarity via ChromaDB. Chunks scoring below `0.45` are discarded before being passed to the agent.
+- **Chunk IDs:** `SHA-256(filepath::index)[:16]` — deterministic and deduplication-safe on re-ingest.
 
-**Why:** The `docs/` directory is structured markdown with clear heading boundaries. Heading-aware chunking ensures a chunk about "Rotating a Deploy Key" stays together instead of being cut mid-procedure. Better retrieval relevance than pure character splitting.
+### Performance
 
-### Vector Store — ChromaDB + Google text-embedding-004
-
-ChromaDB with cosine similarity, persisted to `./chroma_db`. Embedding model: Google `text-embedding-004` (768-dim).
-
-**Why:** Simplest persistent vector store — no server, single `PersistentClient` call. Consistent with the Gemini ADK stack. Stable chunk IDs (SHA-256 of `filepath::index`) prevent duplicates on re-ingest.
+- `genai.Client` and ChromaDB collection are `@lru_cache` singletons — initialized once, not per request.
+- `AgentTool` wrappers for sub-agents are module-level — only the root agent's instruction string is rebuilt per turn to inject fresh session context.
+- All LLM and vector store calls are wrapped in `asyncio.wait_for` with configurable timeouts.
 
 ---
 
@@ -164,80 +144,33 @@ ChromaDB with cosine similarity, persisted to `./chroma_db`. Embedding model: Go
 
 ```
 app/
-├── main.py                    # FastAPI app, lifespan, error handlers
-├── settings.py                # Pydantic Settings (reads .env)
+├── main.py                      # FastAPI app, lifespan, error handlers
+├── settings.py                  # Pydantic Settings from .env
 ├── agents/
-│   ├── orchestrator.py        # Root agent with AgentTool routing
-│   ├── knowledge.py           # KnowledgeAgent (RAG)
-│   ├── account.py             # AccountAgent (builds/status)
+│   ├── orchestrator.py          # Root agent + singleton AgentTools
+│   ├── knowledge.py             # KnowledgeAgent (RAG)
+│   ├── account.py               # AccountAgent
 │   └── tools/
-│       ├── search_docs.py     # ChromaDB retrieval tool
-│       └── account_tools.py   # Mock build/account data tools
+│       ├── search_docs.py       # ChromaDB retrieval, ContextVar trace hook
+│       └── account_tools.py     # Build and account data tools
 ├── rag/
-│   └── ingest.py              # CLI: chunk → embed → upsert to ChromaDB
+│   └── ingest.py                # CLI: chunk → embed → upsert
 ├── srop/
-│   ├── pipeline.py            # Core: load state → ADK → save state+trace
-│   └── state.py               # SessionState Pydantic model
+│   ├── pipeline.py              # Core orchestration loop
+│   └── state.py                 # SessionState model
 ├── api/
-│   ├── routes_sessions.py     # POST /v1/sessions
-│   ├── routes_chat.py         # POST /v1/chat/{session_id}
-│   ├── routes_traces.py       # GET /v1/traces/{trace_id}
-│   └── errors.py              # HelixError hierarchy + RFC 7807 handler
+│   ├── routes_sessions.py
+│   ├── routes_chat.py
+│   ├── routes_traces.py
+│   └── errors.py                # HelixError + RFC 7807 handler
 ├── db/
-│   ├── models.py              # SQLAlchemy ORM models
-│   └── session.py             # Async engine + get_db dependency
+│   ├── models.py                # SQLAlchemy ORM models
+│   └── session.py               # Async engine + get_db dependency
 └── obs/
-    └── logging.py             # structlog JSON logging
+    └── logging.py               # structlog JSON logging
 
 tests/
-├── conftest.py                # Fixtures: in-memory DB, async client, mock_adk
-├── test_api.py                # Integration tests (8 tests)
-└── test_retriever.py          # Unit tests for chunker + metadata (6 tests)
-
-docs/                          # Product docs ingested into ChromaDB
+├── conftest.py                  # In-memory DB, async client, mock_adk
+├── test_api.py                  # Integration tests
+└── test_retriever.py            # Unit tests — chunker + metadata
 ```
-
----
-
-## Known Limitations
-
-- **No cross-turn conversation context** — agent sees user state but not prior messages. Follow-up questions like "tell me more" won't work across turns.
-- **Mock account data** — `get_recent_builds` and `get_account_status` return hardcoded data.
-- **No authentication** — all endpoints are open.
-- **Single-file SQLite** — not suitable for multi-process deployments without a shared DB.
-
----
-
-## What I'd Do With More Time
-
-- **E2 Escalation agent** — `create_ticket` tool writing to a `tickets` table (already scaffolded)
-- **E3 SSE streaming** — `StreamingResponse` yielding ADK events as server-sent events
-- **E6 Docker** — `docker-compose.yml` with app + ingest as a one-command setup
-- **Pattern 2 state** — re-hydrate message history for multi-turn contextual conversations
-- **Score threshold filtering** — discard chunks below 0.6 cosine similarity
-
----
-
-## Time Breakdown
-
-| Phase | Time |
-|-------|------|
-| Setup + DB + FastAPI routes | ~45 min |
-| RAG ingest + search_docs tool | ~45 min |
-| ADK agents (knowledge, account, orchestrator) | ~30 min |
-| pipeline.py + state persistence | ~40 min |
-| Tests + conftest mock | ~30 min |
-| README + docs | ~10 min |
-| **Total** | **~3.5 hrs** |
-
----
-
-## Extensions Completed
-
-- [ ] E1: Idempotency (`Idempotency-Key` header)
-- [ ] E2: Escalation agent
-- [ ] E3: Streaming SSE
-- [ ] E4: LLM-as-judge reranker
-- [ ] E5: Guardrails (out-of-scope refusal + PII redaction)
-- [ ] E6: Docker + docker-compose
-- [ ] E7: Eval harness

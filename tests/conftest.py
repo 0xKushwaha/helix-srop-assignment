@@ -55,6 +55,7 @@ def mock_adk(monkeypatch):
         session_id: str,
         user_message: str,
         state,
+        history: list[dict] | None = None,
     ) -> tuple[str, str, list[dict], list[str]]:
         msg = user_message.lower()
         # Account keywords checked first to avoid "what" swallowing plan-tier queries
