@@ -21,7 +21,7 @@ python -m app.rag.ingest --path docs/
 uvicorn app.main:app --reload
 ```
 
-Get a free API key at [aistudio.google.com](https://aistudio.google.com).
+Get the API key at [aistudio.google.com](https://aistudio.google.com).
 
 ---
 
@@ -56,7 +56,6 @@ curl -s -X POST http://localhost:8000/v1/chat/$SESSION \
 
 ```bash
 pytest -q
-# 13 passed, 1 skipped in ~0.2s
 ```
 
 LLM is mocked at the `_call_adk` boundary — the full suite runs instantly without a real API key.
