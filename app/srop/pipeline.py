@@ -23,13 +23,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.orchestrator import (
     ACCOUNT_AGENT_NAME,
+    ESCALATION_AGENT_NAME,
     KNOWLEDGE_AGENT_NAME,
     build_root_agent,
 )
+from app.agents.tools.escalation_tools import reset_ticket_context, set_ticket_context
 from app.agents.tools.search_docs import _chunk_ids_var
 from app.api.errors import SessionNotFoundError, UpstreamTimeoutError
 from app.db.models import AgentTrace, Message, Session
 from app.settings import settings
+from app.srop.guardrails import OUT_OF_SCOPE_REPLY, is_out_of_scope, redact_pii
 from app.srop.state import SessionState
 
 log = structlog.get_logger()
@@ -61,6 +64,7 @@ async def _call_adk(
     user_message: str,
     state: SessionState,
     history: list[dict],
+    db: AsyncSession | None = None,
 ) -> tuple[str, str, list[dict], list[str]]:
     """Run one ADK turn. Returns (reply, routed_to, tool_calls, chunk_ids)."""
     agent = build_root_agent(
@@ -82,7 +86,8 @@ async def _call_adk(
     chunk_ids: list[str] = []
     reply_text = ""
 
-    token = _chunk_ids_var.set(chunk_ids)
+    chunk_token = _chunk_ids_var.set(chunk_ids)
+    ticket_token = set_ticket_context(db, session_id, state.user_id) if db is not None else None
     try:
         async for event in runner.run_async(
             user_id=state.user_id,
@@ -104,10 +109,14 @@ async def _call_adk(
                     routed_to = "knowledge"
                 elif author == ACCOUNT_AGENT_NAME:
                     routed_to = "account"
+                elif author == ESCALATION_AGENT_NAME:
+                    routed_to = "escalation"
                 else:
                     routed_to = "smalltalk"
     finally:
-        _chunk_ids_var.reset(token)
+        _chunk_ids_var.reset(chunk_token)
+        if ticket_token is not None:
+            reset_ticket_context(ticket_token)
 
     return reply_text, routed_to, tool_calls, chunk_ids
 
@@ -130,19 +139,33 @@ async def run(session_id: str, user_message: str, db: AsyncSession) -> PipelineR
     )
     log.info("pipeline_started", turn=state.turn_count + 1, message_len=len(user_message))
 
+    # Inbound guardrail — redact PII before anything reaches the LLM.
+    redacted_message = redact_pii(user_message)
+
     start_ms = time.monotonic()
 
-    try:
-        reply, routed_to, tool_calls, chunk_ids = await asyncio.wait_for(
-            _call_adk(session_id, user_message, state, history),
-            timeout=settings.llm_timeout_seconds,
-        )
-    except asyncio.TimeoutError:
-        raise UpstreamTimeoutError(
-            f"LLM did not respond within {settings.llm_timeout_seconds}s"
-        )
+    # Out-of-scope shortcut — skip the LLM entirely for clearly off-topic queries.
+    if is_out_of_scope(redacted_message):
+        log.info("guardrail_out_of_scope")
+        reply = OUT_OF_SCOPE_REPLY
+        routed_to = "guardrail"
+        tool_calls: list[dict] = []
+        chunk_ids: list[str] = []
+        latency_ms = int((time.monotonic() - start_ms) * 1000)
+    else:
+        try:
+            reply, routed_to, tool_calls, chunk_ids = await asyncio.wait_for(
+                _call_adk(session_id, redacted_message, state, history, db),
+                timeout=settings.llm_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            raise UpstreamTimeoutError(
+                f"LLM did not respond within {settings.llm_timeout_seconds}s"
+            )
 
-    latency_ms = int((time.monotonic() - start_ms) * 1000)
+        # Outbound guardrail — strip PII the model may have echoed back.
+        reply = redact_pii(reply)
+        latency_ms = int((time.monotonic() - start_ms) * 1000)
 
     state.turn_count += 1
     state.last_agent = routed_to  # type: ignore[assignment]
@@ -153,7 +176,7 @@ async def run(session_id: str, user_message: str, db: AsyncSession) -> PipelineR
         message_id=str(uuid.uuid4()),
         session_id=session_id,
         role="user",
-        content=user_message,
+        content=redacted_message,
         trace_id=trace_id,
     ))
     db.add(Message(

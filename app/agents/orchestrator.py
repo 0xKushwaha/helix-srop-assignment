@@ -18,17 +18,20 @@ from google.adk.agents import LlmAgent
 from google.adk.tools.agent_tool import AgentTool
 
 from app.agents.account import account_agent
+from app.agents.escalation import escalation_agent
 from app.agents.knowledge import knowledge_agent
 from app.settings import settings
 
 # Canonical agent names — used for routing detection in pipeline.py
 KNOWLEDGE_AGENT_NAME = "knowledge_agent"
 ACCOUNT_AGENT_NAME = "account_agent"
+ESCALATION_AGENT_NAME = "escalation_agent"
 ROOT_AGENT_NAME = "srop_root"
 
 # Pre-built AgentTools — reused across all turns (singleton)
 _knowledge_tool = AgentTool(agent=knowledge_agent)
 _account_tool = AgentTool(agent=account_agent)
+_escalation_tool = AgentTool(agent=escalation_agent)
 
 ROOT_INSTRUCTION = """You are the Helix Support Concierge — a routing agent.
 Call the correct specialist tool based on the user's intent.
@@ -36,7 +39,9 @@ Call the correct specialist tool based on the user's intent.
 Routing rules:
 - HOW to do something, WHAT something is, docs/feature questions → knowledge_agent
 - Their builds, pipelines, account status, plan tier, usage → account_agent
+- Filing a ticket, escalating, reporting a bug, asking for a human → escalation_agent
 - Greetings, thanks, off-topic → respond directly without calling a tool
+- Out-of-scope (weather, sports, recipes, etc.) → politely refuse
 
 Always call a tool when intent matches. Never answer knowledge or account questions yourself.
 Use the user context and conversation history provided above when relevant."""
@@ -71,5 +76,5 @@ def build_root_agent(
         name=ROOT_AGENT_NAME,
         model=settings.adk_model,
         instruction=context_block + "\n" + ROOT_INSTRUCTION,
-        tools=[_knowledge_tool, _account_tool],
+        tools=[_knowledge_tool, _account_tool, _escalation_tool],
     )

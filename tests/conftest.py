@@ -56,9 +56,33 @@ def mock_adk(monkeypatch):
         user_message: str,
         state,
         history: list[dict] | None = None,
+        db=None,
     ) -> tuple[str, str, list[dict], list[str]]:
         msg = user_message.lower()
-        # Account keywords checked first to avoid "what" swallowing plan-tier queries
+        # Escalation first — explicit user intent
+        if any(kw in msg for kw in ("escalate", "ticket", "talk to a human", "report a bug", "file a")):
+            from app.agents.tools.escalation_tools import (
+                create_ticket,
+                reset_ticket_context,
+                set_ticket_context,
+            )
+            token = set_ticket_context(db, session_id, state.user_id) if db is not None else None
+            try:
+                ticket_msg = await create_ticket(
+                    subject=user_message[:80],
+                    body=user_message,
+                    priority="normal",
+                )
+            finally:
+                if token is not None:
+                    reset_ticket_context(token)
+            return (
+                f"Done — {ticket_msg}",
+                "escalation",
+                [{"tool_name": "create_ticket", "args": {"subject": user_message[:80], "priority": "normal"}, "result": None}],
+                [],
+            )
+        # Account keywords checked next so "plan tier" / "builds" beat generic question words
         if any(kw in msg for kw in ("plan tier", "plan", "build", "pipeline", "failed", "status", "account")):
             if "plan" in msg or "tier" in msg:
                 return (

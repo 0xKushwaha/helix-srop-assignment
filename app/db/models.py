@@ -55,8 +55,33 @@ class AgentTrace(Base):
 
     trace_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     session_id: Mapped[str] = mapped_column(String(64), index=True)
-    routed_to: Mapped[str] = mapped_column(String(32))        # knowledge | account | smalltalk
+    routed_to: Mapped[str] = mapped_column(String(32))        # knowledge | account | smalltalk | escalation
     tool_calls: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     retrieved_chunk_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     latency_ms: Mapped[int] = mapped_column(default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Ticket(Base):
+    """Support ticket created by EscalationAgent (E2)."""
+    __tablename__ = "tickets"
+
+    ticket_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(64), index=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    subject: Mapped[str] = mapped_column(String(256))
+    body: Mapped[str] = mapped_column(Text)
+    priority: Mapped[str] = mapped_column(String(16), default="normal")  # low | normal | high
+    status: Mapped[str] = mapped_column(String(16), default="open")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class IdempotencyKey(Base):
+    """Cached responses for Idempotency-Key header (E1)."""
+    __tablename__ = "idempotency_keys"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(64), index=True)
+    request_hash: Mapped[str] = mapped_column(String(64))  # sha256 of request body
+    response_body: Mapped[dict[str, Any]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

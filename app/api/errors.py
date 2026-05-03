@@ -38,6 +38,16 @@ class RateLimitedError(HelixError):
     error_code = "RATE_LIMITED"
 
 
+class IdempotencyConflictError(HelixError):
+    status_code = 409
+    error_code = "IDEMPOTENCY_CONFLICT"
+
+
+class GuardrailViolationError(HelixError):
+    status_code = 400
+    error_code = "GUARDRAIL_VIOLATION"
+
+
 async def helix_error_handler(request: Request, exc: HelixError) -> JSONResponse:
     """Convert HelixError → RFC 7807 problem detail."""
     return JSONResponse(

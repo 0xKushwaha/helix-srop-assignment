@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 class SessionState(BaseModel):
     user_id: str
     plan_tier: Literal["free", "pro", "enterprise"] = "free"
-    last_agent: Literal["knowledge", "account", "smalltalk"] | None = None
+    last_agent: Literal["knowledge", "account", "smalltalk", "escalation", "guardrail"] | None = None
     turn_count: int = 0
 
     def to_db_dict(self) -> dict:

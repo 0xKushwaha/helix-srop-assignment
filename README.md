@@ -56,36 +56,47 @@ curl -s -X POST http://localhost:8000/v1/chat/$SESSION \
 
 ```bash
 pytest -q
+# 27 passed, 1 skipped in ~0.4s
 ```
 
 LLM is mocked at the `_call_adk` boundary — the full suite runs instantly without a real API key.
+
+The skipped test (`test_search_docs_returns_results_with_chunk_ids`) requires a seeded vector store; run `python -m app.rag.ingest --path docs/` first to enable it.
 
 ---
 
 ## Architecture
 
 ```
-POST /v1/chat/{session_id}
+POST /v1/chat/{session_id}      ← optional Idempotency-Key
          │
          ▼
+┌─────────────────────────────────────────────┐
+│  Idempotency layer  →  cached response (E1) │
+└──────────────────┬──────────────────────────┘
+                   ▼
 ┌─────────────────────────────────────────────┐
 │  SROP Pipeline                              │
 │  1. Load SessionState from SQLite           │
 │  2. Re-hydrate last 10 messages             │
-│  3. Build root agent (state + history)      │
-│  4. asyncio.wait_for → InMemoryRunner       │
-│  5. Stream events → routing + tool traces   │
-│  6. Persist state / messages / trace to DB  │
+│  3. Inbound guardrail: PII redaction (E5)   │
+│  4. Out-of-scope check → short-circuit (E5) │
+│  5. Build root agent (state + history)      │
+│  6. asyncio.wait_for → InMemoryRunner       │
+│  7. Stream events → routing + tool traces   │
+│  8. Outbound guardrail: PII redaction (E5)  │
+│  9. Persist state / messages / trace to DB  │
 └──────────────────┬──────────────────────────┘
                    │  AgentTool (LLM-driven routing)
-         ┌─────────┴──────────┐
-         ▼                    ▼
-   KnowledgeAgent        AccountAgent
-   └─ search_docs()      └─ get_recent_builds()
-          │                  get_account_status()
-          ▼
-    ChromaDB · cosine similarity
-    Google text-embedding-004
+       ┌───────────┼────────────┐
+       ▼           ▼            ▼
+KnowledgeAgent  AccountAgent  EscalationAgent (E2)
+└─ search_docs  └─ builds     └─ create_ticket
+                  account
+       │
+       ▼
+ChromaDB · cosine similarity
+Google text-embedding-004
 ```
 
 **Database schema**
@@ -94,8 +105,10 @@ POST /v1/chat/{session_id}
 |---|---|
 | `users` | user_id, plan_tier |
 | `sessions` | session_id, state (JSON), timestamps |
-| `messages` | per-turn user/assistant messages with trace_id |
+| `messages` | per-turn user/assistant messages (PII-redacted) with trace_id |
 | `agent_traces` | routed_to, tool_calls, chunk_ids, latency_ms |
+| `tickets` | escalation tickets — subject, body, priority, status (E2) |
+| `idempotency_keys` | cached responses keyed by `Idempotency-Key` header (E1) |
 
 ---
 
@@ -136,6 +149,33 @@ The root orchestrator uses ADK's `AgentTool` pattern. The LLM selects `knowledge
 - `genai.Client` and ChromaDB collection are `@lru_cache` singletons — initialized once, not per request.
 - `AgentTool` wrappers for sub-agents are module-level — only the root agent's instruction string is rebuilt per turn to inject fresh session context.
 - All LLM and vector store calls are wrapped in `asyncio.wait_for` with configurable timeouts.
+
+---
+
+## Extensions
+
+### E1 · Idempotency
+
+Clients can supply an `Idempotency-Key` header on `POST /v1/chat/{id}`. The first call runs the pipeline and persists the response keyed by `(key → request_hash, response_body)`. Subsequent calls with the same key + same body return the cached response. Same key + different body returns `409 IDEMPOTENCY_CONFLICT`.
+
+```bash
+curl -X POST http://localhost:8000/v1/chat/$SESSION \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: req-$(uuidgen)" \
+  -d '{"content": "How do I rotate a deploy key?"}'
+```
+
+### E2 · Escalation Agent
+
+A third specialist agent (`escalation_agent`) handles requests like *"file a ticket"* or *"talk to a human"*. It exposes a `create_ticket(subject, body, priority)` tool that writes to the `tickets` table. The DB session is passed to the tool via a request-scoped `ContextVar` to avoid threading a handle through the ADK signature. Routed via the same `AgentTool` pattern as the other specialists — no string parsing.
+
+### E5 · Guardrails
+
+Two-stage protection wraps every turn:
+
+- **Inbound PII redaction** — emails, SSNs, credit card numbers, phone numbers, and API key patterns are replaced with `[EMAIL]`, `[SSN]`, `[CARD]`, etc. before the message reaches the LLM or is persisted to `messages`.
+- **Outbound PII redaction** — the same regex pass runs on the agent's reply before returning it to the client.
+- **Out-of-scope refusal** — clearly non-Helix queries (weather, sports, recipes, etc.) short-circuit before any LLM call and return a polite refusal. Routing tag: `guardrail`.
 
 ---
 
